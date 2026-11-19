@@ -600,7 +600,7 @@ async function imageToVideo(job) {
 }
 
 // ------------------------------------------------------------ 🤖 短片 Agent
-const RUN_STATUS = { queued: "排隊中", planning: "規劃中", generating: "生成中", done: "完成", error: "失敗" };
+const RUN_STATUS = { queued: "排隊中", planning: "規劃中", generating: "生成中", done: "完成", error: "失敗", interrupted: "已中斷" };
 const SEG_STATUS = { waiting: "等待", rewriting: "改寫提示詞", generating: "生成中", done: "完成" };
 
 async function startAgent() {
@@ -636,7 +636,9 @@ function runCard(r) {
     return `<div class="aseg"><div><div class="sno">第 ${i + 1} 段</div><div>${s.seconds}s</div><span class="sst ${st}">${SEG_STATUS[st] || st}</span></div>
       <div>${esc(s.action)}${lines}<div class="hint">結尾：${esc(s.end_state)}</div></div></div>`;
   }).join("");
-  const fin = r.final?.full_video ? `outputs/${r.final.full_video}` : r.final?.video ? viewUrl(r.final.video) : "";
+  const fin = r.final?.asset_file ? `library/${encodeURIComponent(r.final.asset_file)}`
+    : r.final?.full_video ? `outputs/${r.final.full_video}` : r.final?.video ? viewUrl(r.final.video) : "";
+  const active = ["queued", "planning", "generating"].includes(r.status);
   return `<div class="run" data-id="${r.id}">
     <h3>${esc(plan.title || r.instruction.slice(0, 30))}</h3>
     ${plan.logline ? `<div class="logline">${esc(plan.logline)}</div>` : ""}
@@ -647,7 +649,8 @@ function runCard(r) {
     ${r.error ? `<div class="error">${esc(r.error)}</div>` : ""}
     ${fin ? `<video controls preload="metadata" src="${fin}"></video>` : ""}
     ${segs}
-    ${r.status === "planning" || r.status === "generating" ? `<div class="revise"><button class="pill small" data-ract="stop">停止</button></div>` :
+    ${r.can_resume ? '<div class="revise"><button class="pill small blue" data-ract="resume">繼續短片</button></div>' : ""}
+    ${active ? `<div class="revise"><button class="pill small" data-ract="stop">停止</button></div>` :
       r.plan ? `<div class="revise"><input placeholder="想改什麼？例：第二段改成下雨，她撐著傘" maxlength="200"><button class="pill small blue" data-ract="revise">✏️ 修改</button></div>` : ""}
     <div class="rlog">${(r.log || []).slice(-4).map(l => esc(l[1])).join("<br>")}</div></div>`;
 }
@@ -954,6 +957,13 @@ function bind() {
     const run = e.target.closest(".run")?.dataset.id;
     const act = e.target.dataset.ract;
     if (!run || !act) return;
+    if (act === "resume") {
+      e.target.disabled = true;
+      api("api/agent/resume", { id: run })
+        .then(() => { toast("正在從已存進度繼續"); loadRuns(); })
+        .catch(err => { e.target.disabled = false; toast(err.message, true); });
+      return;
+    }
     if (act === "revise") {
       const input = e.target.closest(".run").querySelector(".revise input");
       if (!input.value.trim()) return toast("寫一句想怎麼改", true);

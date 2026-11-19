@@ -263,9 +263,12 @@ def comfy(cfg, path, payload=None, timeout=60):
         return json.load(r)
 
 
-def queue_prompt(cfg, wf):
+def queue_prompt(cfg, wf, prompt_id=None):
+    payload = {"prompt": wf, "client_id": MONITOR.client_id}
+    if prompt_id:
+        payload["prompt_id"] = prompt_id
     try:
-        return comfy(cfg, "/prompt", {"prompt": wf, "client_id": MONITOR.client_id})["prompt_id"]
+        return comfy(cfg, "/prompt", payload)["prompt_id"]
     except urllib.error.HTTPError as e:
         raise RuntimeError("ComfyUI 拒絕了工作流：" + e.read().decode("utf-8", "replace")[:2000])
 
@@ -543,21 +546,25 @@ def video_frames(path, count):
     return duration, out
 
 
-def last_frame(path):
+def last_frame(path, *, min_duration=None):
     """The final decodable frame of a video."""
     frame = None
     with av.open(str(path)) as c:
         stream = c.streams.video[0]
         duration = probe_video(path)[0]
+        if min_duration is not None and duration < min_duration:
+            raise ValueError("影片長度不足")
         c.seek(int(max(0.0, duration - 1.5) / stream.time_base), stream=stream, backward=True)
         for f in c.decode(stream):
             frame = f
     if frame is None:
         raise ValueError("讀不到延伸影片的最後一格")
+    if min_duration is not None and (frame.time is None or frame.time < duration - 0.25 or frame.is_corrupt):
+        raise ValueError("影片末尾不完整")
     return frame.to_image()
 
 
-def add_asset(cfg, filename, body, folder=None):
+def add_asset(cfg, filename, body, folder=None, *, from_job=None):
     ext = Path(filename).suffix.lower()
     kind = "image" if ext in IMAGE_EXT else "video" if ext in VIDEO_EXT else "audio" if ext in AUDIO_EXT else None
     if kind is None:
@@ -568,6 +575,8 @@ def add_asset(cfg, filename, body, folder=None):
     stored.write_bytes(body)
     item = {"id": asset_id, "name": Path(filename).name, "kind": kind, "file": stored.name,
             "comfy_name": f"h3fe_{asset_id}{ext}", "created": time.time(), "folder": folder or None}
+    if from_job:
+        item["from_job"] = from_job
     thumb = LIBRARY / f"{asset_id}_thumb.jpg"
     if kind == "image":
         with Image.open(stored) as im:
@@ -593,36 +602,36 @@ def add_asset(cfg, filename, body, folder=None):
     return item
 
 
-def add_output_to_library(cfg, job_id, folder=None):
+def add_output_to_library(cfg, job_id, folder=None, *, reuse=False):
     job = next((j for j in load_json(JOBS_PATH, []) if j["id"] == job_id), None)
     if not job or job.get("status") != "done":
         raise ValueError("這個工作還沒有完成的影片")
-    if job.get("image"):
-        # 🎬 變成影片 and ＋加入素材庫 on the same picture must not stack up copies in the library
-        known = next((i for i in library_index() if i.get("from_job") == job_id), None)
+    if reuse or job.get("image"):
+        known = next((i for i in library_index() if i.get("from_job") == job_id and (LIBRARY / i["file"]).is_file()), None)
         if known:
             return known
+    if job.get("image"):
         tmp = OUTPUTS / f"_lib_{job_id}.png"
         comfy_download(cfg, job["image"], tmp)
         body = tmp.read_bytes()
         tmp.unlink(missing_ok=True)
-        item = add_asset(cfg, job["image"]["filename"], body, folder)
-        with lock:
-            index = library_index()
-            for i in index:
-                if i["id"] == item["id"]:
-                    i["from_job"] = job_id
-            save_json(LIBRARY / "library.json", index)
-        return dict(item, from_job=job_id)
+        return add_asset(cfg, job["image"]["filename"], body, folder, from_job=job_id)
     if job.get("full_video"):
         body, name = (OUTPUTS / job["full_video"]).read_bytes(), job["full_video"]
     else:
         v = job["video"]
-        tmp = OUTPUTS / f"_lib_{job_id}.mp4"
-        comfy_download(cfg, v, tmp)
-        body, name = tmp.read_bytes(), v["filename"]
-        tmp.unlink(missing_ok=True)
-    return add_asset(cfg, name, body, folder)
+        path = local_comfy_video(v) if reuse else None
+        name = v["filename"]
+        if path:
+            body = path.read_bytes()
+        else:
+            tmp = OUTPUTS / f"_lib_{job_id}.mp4"
+            try:
+                comfy_download(cfg, v, tmp)
+                body = tmp.read_bytes()
+            finally:
+                tmp.unlink(missing_ok=True)
+    return add_asset(cfg, name, body, folder, from_job=job_id if reuse else None)
 
 
 def delete_asset(cfg, asset_id):
@@ -1284,7 +1293,15 @@ def build_generate(cfg, final_text, chosen, task, req, size, src_job=None):
     return wf, wf[N_SAMPLER]["inputs"]["seed"]
 
 
-def generate(cfg, req):
+def save_job(job, previous_id=None):
+    with lock:
+        jobs = load_json(JOBS_PATH, [])
+        jobs = [j for j in jobs if j["id"] not in (job["id"], previous_id)]
+        jobs.append(job)
+        save_json(JOBS_PATH, sorted(jobs, key=lambda j: -j["created"]))
+
+
+def generate(cfg, req, *, attempt=None):
     mode = req.get("mode", "ref")
     if mode not in ("ref", "frames", "text"):
         raise ValueError("未知的模式")
@@ -1300,7 +1317,7 @@ def generate(cfg, req):
         auto_size = (first.get("width"), first.get("height")) if first.get("width") else None
     size = dims(req["aspect"], req["resolution"], auto_size)
 
-    job_id = uuid.uuid4().hex[:12]
+    job_id = attempt or uuid.uuid4().hex[:12]
     src_job = None
     if src:
         tail = f"h3t_tail_{job_id}.mp4"
@@ -1308,8 +1325,7 @@ def generate(cfg, req):
                 tail=cfg["extend"]["tail_seconds"])
         src_job = {"tail_name": tail}
     wf, seed = build_generate(cfg, final_text, chosen, task, req, size, src_job)
-    prompt_id = queue_prompt(cfg, wf)
-    job = {"id": prompt_id, "created": time.time(), "status": "queued", "mode": mode, "task": task,
+    job = {"id": job_id, "created": time.time(), "status": "queued", "mode": mode, "task": task,
            "prompt": req["prompt"], "final_prompt": final_text, "seed": seed, "aspect": req["aspect"],
            "resolution": req["resolution"], "width": size[0], "height": size[1], "seconds": req["seconds"],
            "intensity": req.get("intensity", "off"), "skill": req.get("skill") or "", "tray": req.get("tray", []),
@@ -1319,10 +1335,15 @@ def generate(cfg, req):
     if src:
         job["extend"] = {"source_id": src["id"], "source_name": src["name"], "tail": src_job["tail_name"],
                          "has_audio": src.get("has_audio", False)}
-    with lock:
-        jobs = load_json(JOBS_PATH, [])
-        jobs.insert(0, job)
-        save_json(JOBS_PATH, jobs)
+    if attempt:
+        # Save the job before sending it. The output name also identifies the attempt on older ComfyUI versions
+        # that assign their own prompt ID, and on a fresh VM that has no queue history.
+        wf["sv"]["inputs"]["filename_prefix"] = agent_output_prefix(attempt)
+        job.update(agent_attempt=attempt, status="submitting")
+        save_job(job)
+    prompt_id = queue_prompt(cfg, wf, attempt) if attempt else queue_prompt(cfg, wf)
+    job.update(id=prompt_id, status="queued")
+    save_job(job, attempt)
     return job
 
 
@@ -1544,18 +1565,33 @@ def saved_video(entry):
     return None
 
 
+def local_comfy_video(video):
+    """The Colab notebook configures ComfyUI to write directly into DATA/output."""
+    root = DATA / "output"
+    path = (root / video.get("subfolder", "") / video["filename"]).resolve()
+    if root.resolve() in path.parents and path.is_file():
+        return path
+    return None
+
+
 def finish_extend(cfg, job):
     """Join the conformed source and the new clip into one longer video."""
     src = asset(job["extend"]["source_id"])
     OUTPUTS.mkdir(exist_ok=True)
-    part = OUTPUTS / f"{job['id']}_part.mp4"
-    comfy_download(cfg, job["video"], part)
-    full_src = OUTPUTS / f"{job['id']}_src.mp4"
-    conform(LIBRARY / src["file"], full_src, job["width"], job["height"], src.get("has_audio"))
     name = f"{job['id']}_full.mp4"
-    join_clips(full_src, part, OUTPUTS / name)
-    for p in (part, full_src):
-        p.unlink(missing_ok=True)
+    part = OUTPUTS / f"{job['id']}_part.mp4"
+    full_src = OUTPUTS / f"{job['id']}_src.mp4"
+    temporary = OUTPUTS / f"{job['id']}_joining.mp4"
+    local = local_comfy_video(job["video"])
+    try:
+        if not local:
+            comfy_download(cfg, job["video"], part)
+        conform(LIBRARY / src["file"], full_src, job["width"], job["height"], src.get("has_audio"))
+        join_clips(full_src, local or part, temporary)
+        temporary.replace(OUTPUTS / name)
+    finally:
+        for path in (part, full_src, temporary):
+            path.unlink(missing_ok=True)
     (Path(cfg["comfy_input_dir"]) / job["extend"]["tail"]).unlink(missing_ok=True)
     return name
 
@@ -1577,8 +1613,12 @@ def _refresh_jobs(cfg):
         except OSError:
             return jobs
         running = {item[1] for item in q.get("queue_running", [])}
+        queued = {item[1] for item in q.get("queue_pending", [])}
+        joins = []
         for job in pending:
             if job["status"] == "joining":
+                if job.get("video") and job["id"] not in JOINING_JOBS:
+                    joins.append(job)
                 continue
             entry = history_entry(cfg, job["id"])
             if entry and job.get("mode") == "image":
@@ -1601,16 +1641,21 @@ def _refresh_jobs(cfg):
                 job.update(video=saved_video(entry), finished=time.time())
                 if job.get("extend") and job["video"]:
                     job["status"] = "joining"
-                    threading.Thread(target=join_worker, args=(cfg, dict(job)), daemon=True).start()
+                    joins.append(job)
                 else:
                     job["status"] = "done"
             elif job["id"] in running:
                 job["status"] = "running"
+            elif job.get("agent_attempt") and job["id"] not in queued:
+                job.update(status="error", error="ComfyUI 找不到這個工作。可從短片紀錄繼續。")
         with lock:
             stored = {j["id"]: j for j in load_json(JOBS_PATH, [])}
             stored.update({j["id"]: j for j in pending})
             jobs = sorted(stored.values(), key=lambda j: -j["created"])
             save_json(JOBS_PATH, jobs)
+        for job in joins:
+            JOINING_JOBS.add(job["id"])
+            threading.Thread(target=join_worker, args=(cfg, dict(job)), daemon=True).start()
     stats = load_json(STATS_PATH, DEFAULT_STATS)
     for job in jobs:
         if job["status"] in ("queued", "running"):
@@ -1628,7 +1673,8 @@ def join_worker(cfg, job):
         update = {"status": "done", "full_video": finish_extend(cfg, job)}
     except Exception as e:
         update = {"status": "done", "join_error": f"接回原片失敗：{e}"}
-    with lock:
+    with REFRESH_LOCK, lock:
+        JOINING_JOBS.discard(job["id"])
         jobs = load_json(JOBS_PATH, [])
         for j in jobs:
             if j["id"] == job["id"]:
@@ -1673,8 +1719,11 @@ AGENT_REVISE = """下面是目前這支短片的規劃 JSON。使用者想修改
 
 目前的規劃：
 {plan}"""
-AGENT_LOCK = threading.Lock()
+AGENT_LOCK = threading.RLock()
 REFRESH_LOCK = threading.Lock()
+JOINING_JOBS = set()
+AGENT_ACTIVE = set()
+AGENT_WORKING = {"queued", "planning", "generating"}
 AGENT_CANCEL = set()
 AGENT_PLAN_PROGRESS = {}
 
@@ -1684,9 +1733,13 @@ def agent_runs():
 
 
 def agent_runs_status():
-    runs = agent_runs()
     with AGENT_LOCK:
+        runs = agent_runs()
         for run in runs:
+            active = run["id"] in AGENT_ACTIVE
+            if run["status"] in AGENT_WORKING and not active:
+                run.update(status="interrupted", error="Toybox 上次執行已中斷。")
+            run["can_resume"] = not active and run["status"] != "done" and bool(run.get("plan"))
             progress = AGENT_PLAN_PROGRESS.get(run["id"])
             if run["status"] == "planning" and progress:
                 run["plan_progress"] = dict(progress, observed_at=time.time())
@@ -1849,6 +1902,101 @@ def segment_prompt(plan, k):
     return "\n".join(lines)
 
 
+def agent_output_prefix(attempt):
+    return f"H3Toybox/agent_{uuid.UUID(attempt).hex}"
+
+
+def agent_saved_video(job):
+    """Recover a finalized MP4 from Colab's persistent ComfyUI output directory."""
+    candidates = [job["video"]] if job.get("video") else []
+    if attempt := job.get("agent_attempt"):
+        prefix = agent_output_prefix(attempt)
+        for path in sorted((DATA / "output").glob(f"{prefix}_?????_.mp4"), reverse=True):
+            candidates.append({"filename": path.name, "subfolder": "H3Toybox", "type": "output"})
+    for video in candidates:
+        path = local_comfy_video(video)
+        if path and agent_video_complete(path, job["seconds"]):
+            return video
+    return None
+
+
+def agent_video_complete(path, seconds):
+    if not path.is_file():
+        return False
+    try:
+        last_frame(path, min_duration=seconds - 1)
+    except (ValueError, IndexError, OSError, av.error.FFmpegError):
+        return False
+    return True
+
+
+def agent_segment_job(segment):
+    job_id, attempt = segment.get("job"), segment.get("attempt")
+    return next((j for j in load_json(JOBS_PATH, []) if j["id"] == job_id
+                 or (attempt and j.get("agent_attempt") == attempt)), None)
+
+
+def recover_agent_job(cfg, job):
+    """Attach to a live prompt or recover its output. A failed lookup leaves the job retryable."""
+    with REFRESH_LOCK:
+        job_id = job["id"]
+        if job_id in JOINING_JOBS:
+            return job
+
+        full = f"{job_id}_full.mp4"
+        if job.get("extend") and agent_video_complete(OUTPUTS / full, job["seconds"]):
+            job.update(status="done", full_video=full, join_error=None)
+            save_job(job)
+            return job
+
+        attempt = job.get("agent_attempt")
+        prefix = agent_output_prefix(attempt) if attempt else None
+
+        def matches(item):
+            return item[1] == job_id or (prefix and
+                item[2].get("sv", {}).get("inputs", {}).get("filename_prefix") == prefix)
+
+        queue = comfy(cfg, "/queue")
+        active = next((item for key in ("queue_running", "queue_pending")
+                       for item in queue.get(key, []) if matches(item)), None)
+        if active:
+            job.update(id=active[1], status="queued")
+        else:
+            entry = history_entry(cfg, job_id)
+            video = saved_video(entry) if entry and entry["status"].get("status_str") != "error" else None
+            video = video or agent_saved_video(job)
+            if not video and job["status"] == "submitting" and attempt:
+                # Older ComfyUI may allocate an ID even when the submitter supplies one.
+                history = comfy(cfg, "/history?max_items=50")
+                for other_id, other in reversed(list(history.items())):
+                    if matches(other["prompt"]) and other["status"].get("status_str") != "error":
+                        video = saved_video(other)
+                        if video:
+                            job["id"] = other_id
+                            break
+            if not video:
+                if (job["status"] == "done" and job.get("video") and not job.get("extend")
+                        and not local_comfy_video(job["video"])):
+                    return job  # A desktop ComfyUI can still serve a completed file after clearing history.
+                job.update(status="error", error="這個 ComfyUI 工作已無法接回。")
+                save_job(job)
+                return None
+            job.update(video=video, status="joining" if job.get("extend") else "done", join_error=None)
+        job.pop("error", None)
+        save_job(job, job_id)
+        return job
+
+
+def agent_segment_asset(segment):
+    asset_id = segment.get("asset")
+    if not asset_id:
+        return None
+    item = next((i for i in library_index() if i["id"] == asset_id), None)
+    if item and (LIBRARY / item["file"]).is_file():
+        return item
+    return None
+
+
 def wait_job(cfg, job_id, run_id):
     while True:
         if run_id in AGENT_CANCEL:
@@ -1859,15 +2007,18 @@ def wait_job(cfg, job_id, run_id):
         if job["status"] == "error":
             raise RuntimeError(job.get("error") or "生成失敗")
         if job["status"] == "done":
+            if job.get("join_error"):
+                raise RuntimeError(job["join_error"])
             return job
         time.sleep(4)
 
 
-def agent_worker(cfg, run_id, start=0, revise=None):
+def agent_worker(cfg, run_id, revise=None, *, resume=False):
     try:
-        run = next(r for r in agent_runs() if r["id"] == run_id)
+        run = agent_runs_get(run_id)
         cfg = copy.deepcopy(cfg)
         cfg["agent"]["provider"] = run.get("planner") or cfg["agent"]["provider"]
+        start = 0
         if revise is not None or not run.get("plan"):
             progress = {
                 "started_at": time.time(),
@@ -1887,10 +2038,11 @@ def agent_worker(cfg, run_id, start=0, revise=None):
             if revise is not None:  # first segment whose contract changed; everything after it re-chains
                 old = run.get("plan") or {}
                 same_bible = old.get("bible") == plan.get("bible")
-                start = 0
                 if same_bible:
                     olds = old.get("segments") or []
                     while start < min(len(olds), len(plan["segments"])) and olds[start] == plan["segments"][start]:
+                        if run["segments"][start]["status"] != "done" or not agent_segment_asset(run["segments"][start]):
+                            break
                         start += 1
                 agent_log(run_id, f"修改：{revise} → 從第 {start + 1} 段開始重做")
             segs = (run.get("segments") or [])[:start] + [{"status": "waiting"} for _ in plan["segments"][start:]]
@@ -1898,8 +2050,15 @@ def agent_worker(cfg, run_id, start=0, revise=None):
             agent_log(run_id, f"規劃完成（{meta['seconds']} 秒，{meta['rounds']} 輪）" +
                       (f"；仍有提醒：{'；'.join(meta['errors'])}" if meta["errors"] else ""))
         plan = run["plan"]
-        prev_asset = run["segments"][start - 1].get("asset") if start > 0 else None
+        segs = run["segments"]
+        if resume:
+            while start < len(segs) and segs[start]["status"] == "done" and agent_segment_asset(segs[start]):
+                start += 1
+            agent_log(run_id, f"沿用已存規劃，從第 {start + 1} 段繼續" if start < len(segs) else "沿用已完成段落")
+        prev_asset = segs[start - 1].get("asset") if start else None
         for k in range(start, len(plan["segments"])):
+            if run_id in AGENT_CANCEL:
+                raise RuntimeError("已停止")
             seg = plan["segments"][k]
             tray = [{"id": aid, "use_audio": True, "extend": False} for aid in run["images"]]
             if prev_asset and run.get("chain", True):
@@ -1907,32 +2066,88 @@ def agent_worker(cfg, run_id, start=0, revise=None):
             req = {"mode": "ref", "prompt": segment_prompt(plan, k), "tray": tray, "seconds": seg["seconds"],
                    "aspect": run["aspect"], "resolution": run["resolution"], "intensity": run.get("intensity", "off"),
                    "skill": run.get("skill", ""), "fast": True, "seed": None}
-            segs = agent_runs_get(run_id)["segments"]
-            segs[k] = {"status": "rewriting", "prompt": req["prompt"]}
-            agent_update(run_id, segments=segs)
-            req["final_prompt"] = rewrite(cfg, req)["prompt"]
-            job = generate(cfg, req)
-            segs[k].update(status="generating", job=job["id"])
-            agent_update(run_id, segments=segs)
-            job = wait_job(cfg, job["id"], run_id)
-            item = add_output_to_library(cfg, job["id"], run.get("folder"))
+            checkpoint = segs[k]
+            old_job = agent_segment_job(checkpoint) if resume else None
+            saved_req = checkpoint.get("request")
+            # If an earlier clip was regenerated, rebuild dependent prompts against the new extension source.
+            if saved_req and saved_req["tray"] == tray:
+                req = dict(saved_req)
+            elif old_job and old_job.get("tray") == tray and old_job.get("final_prompt") is not None:
+                req.update(final_prompt=old_job["final_prompt"], seed=old_job["seed"])
+            elif old_job:
+                old_job = None
+            job = None
+            item = None
+            if old_job:
+                item = next((i for i in library_index() if i.get("from_job") == old_job["id"]
+                             and (LIBRARY / i["file"]).is_file()), None)
+                job = old_job if item else recover_agent_job(cfg, old_job)
+            if job and not item:
+                checkpoint.update(status="generating", job=job["id"])
+                agent_update(run_id, segments=segs)
+                job = wait_job(cfg, job["id"], run_id)
+                try:
+                    item = add_output_to_library(cfg, job["id"], run.get("folder"), reuse=True)
+                except urllib.error.HTTPError as e:
+                    if e.code != 404:
+                        raise
+                except FileNotFoundError:
+                    pass
+            if not item:
+                if "final_prompt" not in req:
+                    segs[k] = {"status": "rewriting", "prompt": req["prompt"]}
+                    agent_update(run_id, segments=segs)
+                    req["final_prompt"] = rewrite(cfg, req)["prompt"]
+                if req["seed"] is None:
+                    req["seed"] = random.randint(0, 2**48)
+                attempt = str(uuid.uuid4())
+                segs[k] = {"status": "generating", "prompt": req["prompt"], "request": req, "attempt": attempt}
+                agent_update(run_id, segments=segs)
+                if run_id in AGENT_CANCEL:
+                    raise RuntimeError("已停止")
+                job = generate(cfg, req, attempt=attempt)
+                segs[k]["job"] = job["id"]
+                agent_update(run_id, segments=segs)
+                job = wait_job(cfg, job["id"], run_id)
+                item = add_output_to_library(cfg, job["id"], run.get("folder"), reuse=True)
             prev_asset = item["id"]
-            segs[k].update(status="done", asset=item["id"], video=job.get("full_video") or None)
+            segs[k].update(status="done", job=job["id"], asset=prev_asset, video=job.get("full_video"))
             agent_update(run_id, segments=segs)
-        last = agent_runs_get(run_id)["segments"][-1]
-        final_job = next((j for j in load_json(JOBS_PATH, []) if j["id"] == last.get("job")), {})
-        agent_update(run_id, status="done", final={"full_video": final_job.get("full_video"), "video": final_job.get("video")})
+        last = segs[-1]
+        final_job = agent_segment_job(last) or {}
+        item = agent_segment_asset(last)
+        agent_update(run_id, status="done", final={"full_video": final_job.get("full_video"),
+                     "video": final_job.get("video"), "asset_file": item["file"] if item else None})
         agent_log(run_id, "完成 🎬")
     except Exception as e:
         agent_update(run_id, status="error", error=f"{type(e).__name__}: {e}")
     finally:
         with AGENT_LOCK:
             AGENT_PLAN_PROGRESS.pop(run_id, None)
-        AGENT_CANCEL.discard(run_id)
+            AGENT_CANCEL.discard(run_id)
+            AGENT_ACTIVE.discard(run_id)
 
 
 def agent_runs_get(run_id):
-    return next(r for r in agent_runs() if r["id"] == run_id)
+    run = next((r for r in agent_runs() if r["id"] == run_id), None)
+    if run is None:
+        raise ValueError("找不到這支短片")
+    return run
+
+
+def launch_agent(cfg, run_id, status, **kwargs):
+    with AGENT_LOCK:
+        if run_id in AGENT_ACTIVE:
+            raise ValueError("這支短片還在做，請等它結束")
+        run = agent_update(run_id, status=status, error=None)
+        AGENT_ACTIVE.add(run_id)
+        try:
+            threading.Thread(target=agent_worker, args=(cfg, run_id), kwargs=kwargs, daemon=True).start()
+        except RuntimeError as e:
+            AGENT_ACTIVE.discard(run_id)
+            agent_update(run_id, status="error", error=str(e))
+            raise
+        return run
 
 
 def agent_start(cfg, b):
@@ -1953,18 +2168,23 @@ def agent_start(cfg, b):
         runs = agent_runs()
         runs.insert(0, run)
         save_json(AGENT_PATH, runs)
-    threading.Thread(target=agent_worker, args=(cfg, run_id), daemon=True).start()
-    return run
+        return launch_agent(cfg, run_id, "queued")
 
 
 def agent_revise(cfg, b):
-    run = agent_runs_get(b["id"])
-    if run["status"] in ("planning", "generating"):
-        raise ValueError("這支短片還在做，等它好了再改（或先停止）")
-    if not run.get("plan"):
-        raise ValueError("還沒有規劃可以改")
-    threading.Thread(target=agent_worker, args=(cfg, run["id"]), kwargs={"revise": b["message"]}, daemon=True).start()
-    return agent_update(run["id"], status="planning")
+    with AGENT_LOCK:
+        run = agent_runs_get(b["id"])
+        if not run.get("plan"):
+            raise ValueError("還沒有規劃可以改")
+        return launch_agent(cfg, run["id"], "planning", revise=b["message"])
+
+
+def agent_resume(cfg, b):
+    with AGENT_LOCK:
+        run = agent_runs_get(b["id"])
+        if not run.get("plan") or run["status"] == "done":
+            raise ValueError("這支短片沒有可繼續的段落")
+        return launch_agent(cfg, run["id"], "generating", resume=True)
 
 
 # ---------------------------------------------------------------- HTTP
@@ -2077,8 +2297,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(agent_start(cfg, self.body_json()))
             if url.path == "/api/agent/revise":
                 return self.send_json(agent_revise(cfg, self.body_json()))
+            if url.path == "/api/agent/resume":
+                return self.send_json(agent_resume(cfg, self.body_json()))
             if url.path == "/api/agent/stop":
-                AGENT_CANCEL.add(self.body_json()["id"])
+                run_id = self.body_json()["id"]
+                with AGENT_LOCK:
+                    if run_id in AGENT_ACTIVE:
+                        AGENT_CANCEL.add(run_id)
                 return self.send_json({"ok": True})
             if url.path == "/api/jobs/delete":
                 job_id = self.body_json()["id"]

@@ -65,8 +65,14 @@ SelfLift 兩段採樣從 12 步（低 6＋高 6）降到 8 步（低 4＋高 4�
 API 金鑰另外存在 `H3TOYBOX_SECRETS`（預設 `DATA/secrets.json`），不寫進 `config.json`。
 啟動時 `restore_inputs()` 會把素材庫裡、但 ComfyUI input 資料夾缺的檔案補回去（新的執行階段 input 是空的）。
 
-Colab 版 ③ 預設 `SAVE_TO_DRIVE`：DATA＝「我的雲端硬碟/H3Toybox」，ComfyUI 的 `output/H3Toybox` 也連結到那裡的 `videos/`；
+Colab 版 ③ 預設 `SAVE_TO_DRIVE`：DATA＝「我的雲端硬碟/H3Toybox」，ComfyUI 直接寫入底下的 `output/H3Toybox/`；
 `SAVE_API_KEYS` 預設不勾，金鑰只放在執行階段的暫存空間。
+
+## 🤖 短片 Agent 續跑
+
+規劃儲存後，失敗或中斷的短片會顯示「繼續短片」。Toybox 會讀取 `agent_runs.json` 和素材庫，沿用規劃、已完成的影片，以及送件前已儲存的改寫提示詞和 seed。若失敗發生在改寫時，可先到設定換改寫模型再按繼續。
+
+原 ComfyUI 仍在執行時會接回排隊或生成中的工作。Colab 重新啟動後，掛載同一個資料夾就能沿用完整的影片檔。若未存成完整檔案，會重新生成該段。
 
 ## 已知
 
