@@ -619,6 +619,17 @@ async function startAgent() {
 function runCard(r) {
   const plan = r.plan || {};
   const meta = r.plan_meta;
+  const progress = r.plan_progress;
+  let planning = "";
+  if (r.status === "planning" && progress) {
+    const now = progress.observed_at;
+    planning = `<span>已等待 ${Math.max(0, Math.floor(now - progress.started_at))} 秒</span>`;
+    if (progress.stream) {
+      planning += progress.first_event_at
+        ? `<span>首筆資料 ${Math.max(0, progress.first_event_at - progress.started_at).toFixed(1)} 秒</span><span>上次收資料 ${Math.max(0, Math.floor(now - progress.last_event_at))} 秒前</span>`
+        : "<span>等待首筆 SSE 資料</span>";
+    }
+  }
   const segs = (plan.segments || []).map((s, i) => {
     const st = (r.segments || [])[i]?.status || "waiting";
     const lines = (s.dialogue || []).filter(d => d.line).map(d => `<div class="line">${esc(d.who)}：「${esc(d.line)}」</div>`).join("");
@@ -631,7 +642,8 @@ function runCard(r) {
     ${plan.logline ? `<div class="logline">${esc(plan.logline)}</div>` : ""}
     <div class="rmeta"><span>${RUN_STATUS[r.status] || r.status}</span><span>${r.total} 秒</span><span>${r.aspect} ${r.resolution}</span>
       <span>${r.planner === "gemini" ? "💎 Gemini" : "🧠 本地 MoE"}</span>
-      ${meta ? `<span>規劃 ${meta.seconds} 秒・${meta.rounds} 輪</span>` : ""}</div>
+      ${planning}
+      ${meta && r.status !== "planning" ? `<span>規劃 ${meta.seconds} 秒・${meta.rounds} 輪</span>` : ""}</div>
     ${r.error ? `<div class="error">${esc(r.error)}</div>` : ""}
     ${fin ? `<video controls preload="metadata" src="${fin}"></video>` : ""}
     ${segs}
@@ -643,8 +655,12 @@ function runCard(r) {
 async function loadRuns() {
   clearTimeout(loadRuns.t);
   if (state.top !== "agent") return;
-  let runs = [];
-  try { runs = await api("api/agent/runs"); } catch (e) { return; }
+  let runs;
+  try { runs = await api("api/agent/runs"); }
+  catch {
+    loadRuns.t = setTimeout(loadRuns, 3000);
+    return;
+  }
   const panel = $("#agentPanel");
   const html = runs.slice(0, 5).map(runCard).join("") || `<div class="hint">還沒有短片。放幾張參考圖、寫一句話，按「🤖 開始做短片」。</div>`;
   // keep a typed revision and a playing video intact: only redraw when something changed
@@ -731,6 +747,7 @@ async function openSettings() {
   $("#cfgOaUrl").value = rw.openai.base_url || "";
   keyPlaceholder($("#cfgOaKey"), rw.openai.has_key);
   $("#cfgOaModel").value = rw.openai.model || "";
+  $("#cfgAgentStream").checked = c.agent.stream;
   for (const id of ["#gemResult", "#oaResult"]) { $(id).textContent = ""; $(id).className = "vres"; }
   showProvider(rw.provider || "local");
   $("#cfgUrl").value = c.comfy_url;
@@ -770,6 +787,7 @@ async function saveSettings() {
     gemini: { api_key: keyValue($("#cfgGemKey")), model: $("#cfgGemModel").value.trim() || GEMINI_DEFAULTS[0] },
     openai: { base_url: $("#cfgOaUrl").value.trim(), api_key: keyValue($("#cfgOaKey")), model: $("#cfgOaModel").value.trim() },
   });
+  c.agent.stream = $("#cfgAgentStream").checked;
   c.comfy_url = $("#cfgUrl").value.trim();
   const sel = [...document.querySelectorAll("[data-lora]")];
   c.loras = { drama: sel.filter(s => s.value === "drama").map(s => s.dataset.lora), action: sel.filter(s => s.value === "action").map(s => s.dataset.lora) };

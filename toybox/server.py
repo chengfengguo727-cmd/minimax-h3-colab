@@ -102,6 +102,7 @@ DEFAULT_CONFIG = {
         "gemini_key_file": "",
         "temperature": 0.6,
         "max_seconds": 60,
+        "stream": False,
     },
     # 🖼 圖片 tab: Qwen-Image 2.1 with ComfyUI's own template wiring (TextEncodeQwenImage21 + KSampler, cfg 1)
     "image": {
@@ -978,18 +979,18 @@ def rewrite_local(cfg, system, parts, job_id):
     return "".join(entry["outputs"].get("3", {}).get("text", [])).strip()
 
 
-def http_json(url, payload=None, headers=None, timeout=600, retries=2):
+def http_json(url, payload=None, headers=None, timeout=600, retries=2, *, reader=json.load):
     """JSON request; transient server errors (500/502/503, common on free Gemini/Gemma tiers) are retried."""
     data = None if payload is None else json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST" if data else "GET",
                                  headers={"Content-Type": "application/json", **(headers or {})})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.load(r)
+            return reader(r)
     except urllib.error.HTTPError as e:
         if e.code in (500, 502, 503) and retries > 0:
             time.sleep(3)
-            return http_json(url, payload, headers, timeout, retries - 1)
+            return http_json(url, payload, headers, timeout, retries - 1, reader=reader)
         detail = e.read().decode("utf-8", "replace")
         try:
             parsed = json.loads(detail)
@@ -1033,7 +1034,37 @@ def openai_url(base):
     return base if base.endswith("/chat/completions") else base + "/chat/completions"
 
 
-def rewrite_openai(oa, rw, system, parts, max_tokens=None):
+def read_chat_stream(response, on_event):
+    if response.headers.get_content_type() != "text/event-stream":
+        raise RuntimeError("端點未回傳 SSE。請確認端點支援串流，或在設定關閉本地 MoE 串流。")
+    chunks, data_lines = [], []
+    for raw_line in response:
+        line = raw_line.decode("utf-8").rstrip("\r\n")
+        if line.startswith("data:"):
+            data_lines.append(line[5:].removeprefix(" "))
+        if line or not data_lines:
+            continue
+        data = "\n".join(data_lines)
+        data_lines.clear()
+        if on_event:
+            on_event()
+        if data.strip() == "[DONE]":
+            return {"choices": [{"message": {"content": "".join(chunks)}}]}
+
+        event = json.loads(data)
+        if event.get("error"):
+            error = event["error"]
+            detail = error.get("message", str(error)) if isinstance(error, dict) else str(error)
+            raise RuntimeError("端點串流錯誤：" + str(detail)[:300])
+        for choice in event.get("choices") or []:
+            if choice.get("index", 0) == 0:
+                content = (choice.get("delta") or {}).get("content")
+                if isinstance(content, str):
+                    chunks.append(content)
+    raise RuntimeError("端點串流在收到 [DONE] 前中斷。")
+
+
+def rewrite_openai(oa, rw, system, parts, max_tokens=None, *, stream=False, on_event=None):
     content = [{"type": "text", "text": p} if kind == "text" else
                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + jpeg_b64(p)}} for kind, p in parts]
     messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": content}]
@@ -1041,7 +1072,12 @@ def rewrite_openai(oa, rw, system, parts, max_tokens=None):
                "temperature": float(rw["temperature"]), "top_p": float(rw["top_p"]),
                "max_tokens": int(max_tokens or rw["max_length"])}
     headers = {"Authorization": "Bearer " + oa["api_key"]} if oa.get("api_key") else {}
-    out = http_json(openai_url(oa.get("base_url")), payload, headers)
+    reader = json.load
+    if stream:
+        payload["stream"] = True
+        headers["Accept"] = "text/event-stream"
+        reader = lambda response: read_chat_stream(response, on_event)
+    out = http_json(openai_url(oa.get("base_url")), payload, headers, reader=reader)
     try:
         text = out["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):
@@ -1640,10 +1676,21 @@ AGENT_REVISE = """下面是目前這支短片的規劃 JSON。使用者想修改
 AGENT_LOCK = threading.Lock()
 REFRESH_LOCK = threading.Lock()
 AGENT_CANCEL = set()
+AGENT_PLAN_PROGRESS = {}
 
 
 def agent_runs():
     return load_json(AGENT_PATH, [])
+
+
+def agent_runs_status():
+    runs = agent_runs()
+    with AGENT_LOCK:
+        for run in runs:
+            progress = AGENT_PLAN_PROGRESS.get(run["id"])
+            if run["status"] == "planning" and progress:
+                run["plan_progress"] = dict(progress, observed_at=time.time())
+    return runs
 
 
 def agent_update(run_id, **fields):
@@ -1666,7 +1713,7 @@ def agent_log(run_id, text):
         save_json(AGENT_PATH, runs)
 
 
-def agent_chat(cfg, system, parts):
+def agent_chat(cfg, system, parts, *, on_event=None):
     """The planner: OpenAI-compatible (local MoE) or Gemini (key read from a file at call time)."""
     ag = cfg["agent"]
     knobs = {"temperature": float(ag["temperature"]), "top_p": 0.9, "max_length": 4096}
@@ -1677,7 +1724,8 @@ def agent_chat(cfg, system, parts):
     endpoint = cfg["rewriter"]["openai"]
     if not (endpoint.get("base_url") or "").strip():
         endpoint = {"base_url": ag["base_url"], "model": ag.get("model")}
-    return rewrite_openai(endpoint, knobs, system, parts, max_tokens=4096)
+    return rewrite_openai(endpoint, knobs, system, parts, max_tokens=4096,
+                          stream=ag.get("stream", False), on_event=on_event)
 
 
 def parse_contract(text):
@@ -1738,7 +1786,7 @@ def check_contract(plan, labels, total):
     return plan, errors, fixes
 
 
-def agent_plan(cfg, run, revise=None):
+def agent_plan(cfg, run, revise=None, *, on_event=None):
     """One planning call (+ at most one correction call). Returns the checked plan."""
     labels = [f"圖片{i}" for i in range(1, len(run["images"]) + 1)]
     total = int(run["total"])
@@ -1756,7 +1804,7 @@ def agent_plan(cfg, run, revise=None):
     else:
         parts.append(("text", f"指示：{run['instruction']}"))
     t0 = time.time()
-    raw = agent_chat(cfg, system, parts)
+    raw = agent_chat(cfg, system, parts, on_event=on_event)
     plan = parse_contract(raw)
     errors = ["輸出不是合法的 JSON"] if plan is None else check_contract(plan, labels, total)[1]
     rounds = 1
@@ -1764,7 +1812,7 @@ def agent_plan(cfg, run, revise=None):
         agent_log(run["id"], "契約檢查沒過，送回修正：" + "；".join(errors))
         fix = parts + [("text", "你上一版的輸出：\n" + raw[:6000] + "\n\n有這些問題，只修正它們，輸出完整 JSON：\n- "
                         + "\n- ".join(errors))]
-        raw2 = agent_chat(cfg, system, fix)
+        raw2 = agent_chat(cfg, system, fix, on_event=on_event)
         plan2 = parse_contract(raw2)
         rounds = 2
         if plan2 is not None:
@@ -1821,8 +1869,21 @@ def agent_worker(cfg, run_id, start=0, revise=None):
         cfg = copy.deepcopy(cfg)
         cfg["agent"]["provider"] = run.get("planner") or cfg["agent"]["provider"]
         if revise is not None or not run.get("plan"):
+            progress = {
+                "started_at": time.time(),
+                "stream": cfg["agent"]["provider"] == "openai" and cfg["agent"].get("stream", False),
+            }
+            with AGENT_LOCK:
+                AGENT_PLAN_PROGRESS[run_id] = progress
+
+            def record_event():
+                with AGENT_LOCK:
+                    now = time.time()
+                    progress.setdefault("first_event_at", now)
+                    progress["last_event_at"] = now
+
             agent_update(run_id, status="planning")
-            plan, meta = agent_plan(cfg, run, revise)
+            plan, meta = agent_plan(cfg, run, revise, on_event=record_event)
             if revise is not None:  # first segment whose contract changed; everything after it re-chains
                 old = run.get("plan") or {}
                 same_bible = old.get("bible") == plan.get("bible")
@@ -1865,6 +1926,8 @@ def agent_worker(cfg, run_id, start=0, revise=None):
     except Exception as e:
         agent_update(run_id, status="error", error=f"{type(e).__name__}: {e}")
     finally:
+        with AGENT_LOCK:
+            AGENT_PLAN_PROGRESS.pop(run_id, None)
         AGENT_CANCEL.discard(run_id)
 
 
@@ -1951,7 +2014,7 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/jobs":
                 return self.send_json(refresh_jobs(cfg))
             if url.path == "/api/agent/runs":
-                return self.send_json(agent_runs())
+                return self.send_json(agent_runs_status())
             if url.path == "/api/config":
                 wf = json.loads(TEMPLATE_PATH.read_text(encoding="utf-8"))
                 loras = [{"id": k, "name": v["inputs"]["lora_name"], "strength": v["inputs"]["strength_model"]}
