@@ -167,7 +167,7 @@
   <form method="dialog" class="settings-form">
     <div class="settings-head"><h2>⚙ 設定</h2><button value="cancel" class="pill small" title="關閉">✕</button></div>
     <div class="settings-body">
-      <fieldset>
+      <fieldset id="cfgRewriterSettings">
         <legend>✨ 提示詞改寫</legend>
         <div class="providers" id="cfgProvider">
           <label class="prov"><input type="radio" name="provider" value="local"><span><b>🧸 本地小模型</b><small>H3 官方 9B 改寫模型，在 ComfyUI 裡跑，不用金鑰</small></span></label>
@@ -187,18 +187,18 @@
         </div>
 
         <div class="prov-panel" data-panel="gemini">
-          <label>API 金鑰 <span class="key-row"><input id="cfgGemKey" type="password" autocomplete="off"><button type="button" class="pill small" data-clear-key="gemini">清除</button></span></label>
-          <label>模型（可從清單選，也可以自己輸入）<input id="cfgGemModel" type="text" list="gemModels"></label>
+          <label>API 金鑰 <span class="key-row"><input data-api-key type="password" autocomplete="off"><button type="button" class="pill small" data-clear-key>清除</button></span></label>
+          <label>改寫模型 <input data-model type="text" list="gemModels"></label>
           <datalist id="gemModels"></datalist>
-          <div class="verify"><button type="button" class="pill small blue" data-verify="gemini">🔍 驗證</button><span class="vres" id="gemResult"></span></div>
+          <div class="verify"><button type="button" class="pill small blue" data-verify>🔍 驗證</button><span class="vres" aria-live="polite"></span></div>
         </div>
 
         <div class="prov-panel" data-panel="openai">
-          <label>端點網址 <input id="cfgOaUrl" type="text" placeholder="例：https://api.openai.com/v1　或　http://127.0.0.1:1234/v1"></label>
-          <label>API 金鑰（本機伺服器可留空）<span class="key-row"><input id="cfgOaKey" type="password" autocomplete="off"><button type="button" class="pill small" data-clear-key="openai">清除</button></span></label>
-          <label>模型 <input id="cfgOaModel" type="text" list="oaModels" placeholder="例：gpt-5-mini"></label>
+          <label>端點網址 <input data-base-url type="text" placeholder="例：https://api.openai.com/v1　或　http://127.0.0.1:1234/v1"></label>
+          <label>API 金鑰（本機伺服器可留空）<span class="key-row"><input data-api-key type="password" autocomplete="off"><button type="button" class="pill small" data-clear-key>清除</button></span></label>
+          <label>改寫模型 <input data-model type="text" list="oaModels" placeholder="輸入模型 ID 或從驗證清單選擇"></label>
           <datalist id="oaModels"></datalist>
-          <div class="verify"><button type="button" class="pill small blue" data-verify="openai">🔍 驗證</button><span class="vres" id="oaResult"></span></div>
+          <div class="verify"><button type="button" class="pill small blue" data-verify>🔍 驗證</button><span class="vres" aria-live="polite"></span></div>
         </div>
 
         <div class="grid3">
@@ -207,10 +207,28 @@
           <label>參考圖邊長 <input id="cfgSide" type="number" min="256" max="2048" step="64"></label>
         </div>
       </fieldset>
-      <fieldset>
-        <legend>🤖 短片 Agent</legend>
-        <label class="switch"><input id="cfgAgentStream" type="checkbox"><span></span> 本地 MoE 規劃使用 SSE</label>
-        <p class="hint">請使用支援 SSE 的端點，例如 ngrok。</p>
+      <fieldset id="cfgAgentSettings">
+        <legend>🤖 短片 Agent・整片規劃</legend>
+        <details>
+          <summary>🧠 本地 MoE（OpenAI 相容端點）</summary>
+          <div class="prov-panel on" data-panel="openai">
+            <label>端點網址 <input data-base-url type="text" placeholder="輸入 OpenAI 相容端點網址"></label>
+            <label>API 金鑰（本機伺服器可留空）<span class="key-row"><input data-api-key type="password" autocomplete="off"><button type="button" class="pill small" data-clear-key>清除</button></span></label>
+            <label>規劃模型 <input data-model type="text" list="agentOaModels" placeholder="輸入模型 ID 或從驗證清單選擇"></label>
+            <datalist id="agentOaModels"></datalist>
+            <label class="switch"><input id="cfgAgentStream" type="checkbox"><span></span> 規劃使用 SSE</label>
+            <div class="verify"><button type="button" class="pill small blue" data-verify>🔍 驗證</button><span class="vres" aria-live="polite"></span></div>
+          </div>
+        </details>
+        <details>
+          <summary>💎 Gemini</summary>
+          <div class="prov-panel on" data-panel="gemini">
+            <label>API 金鑰 <span class="key-row"><input data-api-key type="password" autocomplete="off"><button type="button" class="pill small" data-clear-key>清除</button></span></label>
+            <label>規劃模型 <input data-model type="text" list="agentGemModels"></label>
+            <datalist id="agentGemModels"></datalist>
+            <div class="verify"><button type="button" class="pill small blue" data-verify>🔍 驗證</button><span class="vres" aria-live="polite"></span></div>
+          </div>
+        </details>
       </fieldset>
       <fieldset>
         <legend>🎛 LoRA 分組（關閉動作強度時只套用「文戲」）</legend>

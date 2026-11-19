@@ -716,19 +716,33 @@ function syncSegs() {
 
 const GEMINI_DEFAULTS = ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemma-4-26b-a4b-it"];
 
-function setDatalist(id, names) {
-  $(id).innerHTML = [...new Set(names)].map(n => `<option value="${esc(n)}">`).join("");
+function setDatalist(list, names) {
+  list.innerHTML = [...new Set(names)].map(n => `<option value="${esc(n)}">`).join("");
 }
 
 function showProvider(p) {
   for (const r of document.querySelectorAll("[name=provider]")) r.checked = r.value === p;
-  for (const el of document.querySelectorAll(".prov-panel")) el.classList.toggle("on", el.dataset.panel === p);
+  for (const el of $("#cfgRewriterSettings").querySelectorAll(".prov-panel")) el.classList.toggle("on", el.dataset.panel === p);
 }
 
 function keyPlaceholder(el, has) {
   el.value = "";
   el.dataset.clear = "";
   el.placeholder = has ? "已儲存（留空＝繼續使用）" : "貼上 API 金鑰";
+}
+
+function setupRemotePanels(fieldset, config) {
+  for (const provider of ["gemini", "openai"]) {
+    const panel = $(`[data-panel="${provider}"]`, fieldset);
+    const profile = config[provider];
+    keyPlaceholder($("[data-api-key]", panel), profile.has_key);
+    $("[data-model]", panel).value = profile.model || "";
+    const url = $("[data-base-url]", panel);
+    if (url) url.value = profile.base_url || "";
+    setDatalist($("datalist", panel), provider === "gemini" ? GEMINI_DEFAULTS : []);
+    $(".vres", panel).textContent = "";
+    $(".vres", panel).className = "vres";
+  }
 }
 
 async function openSettings() {
@@ -744,14 +758,13 @@ async function openSettings() {
   $("#cfgTemp").value = rw.temperature;
   $("#cfgTopP").value = rw.top_p;
   $("#cfgSide").value = rw.image_side;
-  keyPlaceholder($("#cfgGemKey"), rw.gemini.has_key);
-  $("#cfgGemModel").value = rw.gemini.model || GEMINI_DEFAULTS[0];
-  setDatalist("#gemModels", GEMINI_DEFAULTS);
-  $("#cfgOaUrl").value = rw.openai.base_url || "";
-  keyPlaceholder($("#cfgOaKey"), rw.openai.has_key);
-  $("#cfgOaModel").value = rw.openai.model || "";
+  setupRemotePanels($("#cfgRewriterSettings"), rw);
+  const agentSettings = $("#cfgAgentSettings");
+  setupRemotePanels(agentSettings, c.agent);
+  for (const details of agentSettings.querySelectorAll("details")) {
+    details.open = $("[data-panel]", details).dataset.panel === $("#agentPlanner").value;
+  }
   $("#cfgAgentStream").checked = c.agent.stream;
-  for (const id of ["#gemResult", "#oaResult"]) { $(id).textContent = ""; $(id).className = "vres"; }
   showProvider(rw.provider || "local");
   $("#cfgUrl").value = c.comfy_url;
   $("#cfgLoras").innerHTML = lora_nodes.map(l => `
@@ -760,21 +773,36 @@ async function openSettings() {
   $("#settings").showModal();
 }
 
-function keyValue(el) { return el.dataset.clear ? "__CLEAR__" : el.value.trim(); }
-
-function providerForm(p) {
-  if (p === "gemini") return { api_key: $("#cfgGemKey").value.trim(), model: $("#cfgGemModel").value.trim() };
-  return { base_url: $("#cfgOaUrl").value.trim(), api_key: $("#cfgOaKey").value.trim(), model: $("#cfgOaModel").value.trim() };
+function providerForm(panel) {
+  const key = $("[data-api-key]", panel);
+  const conf = {
+    api_key: key.dataset.clear ? "__CLEAR__" : key.value.trim(),
+    model: $("[data-model]", panel).value.trim(),
+  };
+  const url = $("[data-base-url]", panel);
+  if (url) conf.base_url = url.value.trim();
+  return conf;
 }
 
-async function verifyProvider(p) {
-  const out = $(p === "gemini" ? "#gemResult" : "#oaResult");
+function remoteProfiles(fieldset) {
+  return {
+    gemini: providerForm($('[data-panel="gemini"]', fieldset)),
+    openai: providerForm($('[data-panel="openai"]', fieldset)),
+  };
+}
+
+async function verifyProvider(panel) {
+  const provider = panel.dataset.panel;
+  const planner = panel.closest("#cfgAgentSettings") !== null;
+  const out = $(".vres", panel);
   out.className = "vres"; out.textContent = "連線中…";
   try {
-    const r = await api("api/rewriter/test", { provider: p, conf: providerForm(p) });
+    const r = await api(planner ? "api/agent/test" : "api/rewriter/test", {
+      provider, conf: providerForm(panel), stream: planner && $("#cfgAgentStream").checked,
+    });
     out.className = "vres ok";
     out.textContent = `✅ 端點活著（${(r.ms / 1000).toFixed(1)} 秒，回覆「${r.reply}」）` + (r.models.length ? `，清單抓到 ${r.models.length} 個模型` : "");
-    if (r.models.length) setDatalist(p === "gemini" ? "#gemModels" : "#oaModels", (p === "gemini" ? GEMINI_DEFAULTS : []).concat(r.models));
+    if (r.models.length) setDatalist($("datalist", panel), (provider === "gemini" ? GEMINI_DEFAULTS : []).concat(r.models));
   } catch (e) {
     out.className = "vres bad"; out.textContent = "❌ " + e.message;
   }
@@ -787,10 +815,9 @@ async function saveSettings() {
     provider, model: $("#cfgModel").value, thinking: $("#cfgThinking").checked, mtp: $("#cfgMtp").value,
     max_length: +$("#cfgMaxLen").value, temperature: +$("#cfgTemp").value, top_p: +$("#cfgTopP").value,
     image_side: +$("#cfgSide").value,
-    gemini: { api_key: keyValue($("#cfgGemKey")), model: $("#cfgGemModel").value.trim() || GEMINI_DEFAULTS[0] },
-    openai: { base_url: $("#cfgOaUrl").value.trim(), api_key: keyValue($("#cfgOaKey")), model: $("#cfgOaModel").value.trim() },
+    ...remoteProfiles($("#cfgRewriterSettings")),
   });
-  c.agent.stream = $("#cfgAgentStream").checked;
+  Object.assign(c.agent, remoteProfiles($("#cfgAgentSettings")), { stream: $("#cfgAgentStream").checked });
   c.comfy_url = $("#cfgUrl").value.trim();
   const sel = [...document.querySelectorAll("[data-lora]")];
   c.loras = { drama: sel.filter(s => s.value === "drama").map(s => s.dataset.lora), action: sel.filter(s => s.value === "action").map(s => s.dataset.lora) };
@@ -851,14 +878,15 @@ function bind() {
   // settings: provider tabs, verify, clear stored keys, fast-mode hint
   $("#cfgProvider").addEventListener("change", e => showProvider(e.target.value));
   $("#settings").addEventListener("click", e => {
-    if (e.target.dataset.verify) verifyProvider(e.target.dataset.verify);
-    const k = e.target.dataset.clearKey;
-    if (k) {
-      const el = $(k === "gemini" ? "#cfgGemKey" : "#cfgOaKey");
+    if (e.target.matches("[data-verify]")) verifyProvider(e.target.closest(".prov-panel"));
+    if (e.target.matches("[data-clear-key]")) {
+      const el = $("[data-api-key]", e.target.closest(".prov-panel"));
       el.value = ""; el.dataset.clear = "1"; el.placeholder = "儲存後會刪除已存的金鑰";
     }
   });
-  for (const id of ["#cfgGemKey", "#cfgOaKey"]) $(id).addEventListener("input", e => (e.target.dataset.clear = ""));
+  for (const key of $("#settings").querySelectorAll("[data-api-key]")) {
+    key.addEventListener("input", () => (key.dataset.clear = ""));
+  }
   $("#fastMode").addEventListener("change", e => ($("#fastHint").textContent = e.target.checked ? "8 步" : "12 步"));
 
   $("#projGrid").addEventListener("click", e => {

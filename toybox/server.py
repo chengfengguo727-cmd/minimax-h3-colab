@@ -96,9 +96,8 @@ DEFAULT_CONFIG = {
     # gemini = Google API, key read from key_file at call time (never copied into config or the browser)
     "agent": {
         "provider": "openai",
-        "base_url": "http://127.0.0.1:8080/v1",
-        "model": "qwen36-35b-a3b",
-        "gemini_model": "gemini-3.5-flash-lite",
+        "openai": {"base_url": "http://127.0.0.1:8080/v1", "api_key": "", "model": "qwen36-35b-a3b"},
+        "gemini": {"api_key": "", "model": "gemini-3.5-flash-lite"},
         "gemini_key_file": "",
         "temperature": 0.6,
         "max_seconds": 60,
@@ -189,53 +188,93 @@ def deep_merge(base, extra):
     return base
 
 
-API_KEYS = (("rewriter", "gemini"), ("rewriter", "openai"))
+API_KEYS = (
+    ("rewriter", "gemini", "gemini"),
+    ("rewriter", "openai", "openai"),
+    ("agent", "gemini", "agent_gemini"),
+    ("agent", "openai", "agent_openai"),
+)
+CONFIG_LOCK = threading.RLock()
 
 
 def load_config():
-    saved = load_json(CONFIG_PATH, {})
+    with CONFIG_LOCK:
+        saved = load_json(CONFIG_PATH, {})
+        secrets = load_json(SECRETS_PATH, {})
     saved.pop("guide_path", None)  # H3 Studio's single-guide key
     cfg = deep_merge(copy.deepcopy(DEFAULT_CONFIG), saved)
-    secrets = load_json(SECRETS_PATH, {})
-    for a, b in API_KEYS:
-        if secrets.get(b):
-            cfg[a][b]["api_key"] = secrets[b]
+    for section, provider, name in API_KEYS:
+        if name in secrets:
+            cfg[section][provider]["api_key"] = secrets[name]
+    # Seed each new planner profile from the settings the old planner actually used.
+    # Once saved, even an empty value is independent from the rewriter.
+    agent = cfg["agent"]
+    saved_agent = saved.get("agent", {})
+    if "openai" not in saved_agent:
+        shared = cfg["rewriter"]["openai"]
+        if (shared.get("base_url") or "").strip():
+            agent["openai"] = dict(shared)
+        else:
+            for key in ("base_url", "model"):
+                if key in saved_agent:
+                    agent["openai"][key] = saved_agent[key]
+        if "agent_openai" in secrets:
+            agent["openai"]["api_key"] = secrets["agent_openai"]
+    if "gemini" not in saved_agent:
+        agent["gemini"]["model"] = saved_agent.get("gemini_model", agent["gemini"]["model"])
+        agent["gemini"]["api_key"] = secrets.get("agent_gemini", cfg["rewriter"]["gemini"]["api_key"])
     return cfg
+
+
+def model_endpoint(cfg, section, provider):
+    conf = dict(cfg[section][provider])
+    if section == "agent" and provider == "gemini":
+        key_file = Path(cfg["agent"].get("gemini_key_file") or "")
+        if key_file.is_file():
+            conf["api_key"] = key_file.read_text(encoding="utf-8").strip()
+    return conf
 
 
 def public_config(cfg):
     """Config for the browser: API keys are never sent back, only whether one is stored."""
     out = copy.deepcopy(cfg)
-    for a, b in API_KEYS:
-        sect = out[a][b]
-        sect["has_key"] = bool(sect.get("api_key"))
-        sect["api_key"] = ""
+    for section, provider, _ in API_KEYS:
+        conf = out[section][provider]
+        conf["has_key"] = bool(conf.get("api_key"))
+        conf["api_key"] = ""
+    if Path(cfg["agent"].get("gemini_key_file") or "").is_file():
+        out["agent"]["gemini"]["has_key"] = True
     return out
 
 
 def save_config(new):
     """An empty api_key from the form keeps the stored key; "__CLEAR__" removes it."""
-    old = load_config()
-    new = {k: new[k] for k in DEFAULT_CONFIG if k in new}
-    for a, b in API_KEYS:
-        sect = new.get(a, {}).get(b)
-        if isinstance(sect, dict):
-            sect.pop("has_key", None)
-            key = sect.get("api_key", "")
-            sect["api_key"] = "" if key == "__CLEAR__" else key.strip() or old[a][b].get("api_key", "")
-    secrets = {}
-    for a, b in API_KEYS:
-        sect = new.get(a, {}).get(b)
-        key = sect.pop("api_key", "") if isinstance(sect, dict) else old[a][b].get("api_key", "")
-        if key:
-            secrets[b] = key
-    stored = deep_merge(load_json(CONFIG_PATH, {}), new)
-    for a, b in API_KEYS:  # keys written by older versions into config.json
-        stored.get(a, {}).get(b, {}).pop("api_key", None)
-    save_json(CONFIG_PATH, stored)
-    if secrets or SECRETS_PATH.exists():
-        SECRETS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        save_json(SECRETS_PATH, secrets)
+    with CONFIG_LOCK:
+        old = load_config()
+        new = {k: copy.deepcopy(new[k]) for k in DEFAULT_CONFIG if k in new}
+        secrets = {}
+        for section, provider, name in API_KEYS:
+            group = new.setdefault(section, {})
+            draft = group.get(provider, {})
+            profile = dict(old[section][provider], **draft)
+            entered = (draft.get("api_key") or "").strip()
+            if entered and section == "agent" and provider == "gemini":
+                group["gemini_key_file"] = ""  # an explicit key or Clear replaces the old key-file source
+            key = "" if entered == "__CLEAR__" else entered or old[section][provider].get("api_key", "")
+            if key:
+                secrets[name] = key
+            profile.pop("api_key", None)
+            profile.pop("has_key", None)
+            group[provider] = profile
+        stored = deep_merge(load_json(CONFIG_PATH, {}), new)
+        for section, provider, _ in API_KEYS:  # keys written by older versions into config.json
+            stored[section][provider].pop("api_key", None)
+        for key in ("base_url", "model", "gemini_model"):
+            stored["agent"].pop(key, None)
+        if secrets or SECRETS_PATH.exists():
+            SECRETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            save_json(SECRETS_PATH, secrets)
+        save_json(CONFIG_PATH, stored)
 
 
 def restore_inputs(cfg):
@@ -1120,16 +1159,22 @@ def rewrite(cfg, req):
     return {"prompt": text, "seconds_used": used, "task": task, "provider": provider}
 
 
-def test_rewriter(cfg, body):
+def test_model_endpoint(cfg, body, section):
     """Settings' 驗證 button: a tiny POST to the chosen endpoint, plus its model list when it offers one.
 
     An empty api_key in the form means "keep the stored key" (the browser never receives stored keys).
     """
     provider = body.get("provider")
     if provider not in ("gemini", "openai"):
-        raise ValueError("本地小模型不需要驗證")
-    conf = dict(cfg["rewriter"].get(provider, {}))
-    conf.update({k: v for k, v in (body.get("conf") or {}).items() if v not in ("", None)})
+        raise ValueError("請選擇要驗證的端點")
+    conf = model_endpoint(cfg, section, provider)
+    draft = body.get("conf") or {}
+    for field in ("model", "base_url"):
+        if field in draft:
+            conf[field] = draft[field]
+    key = draft.get("api_key", "")
+    if key:
+        conf["api_key"] = "" if key == "__CLEAR__" else key
     rw = dict(cfg["rewriter"], temperature=0.2, top_p=0.9)
     ping = [("text", "Reply with the single word OK.")]
     t0 = time.time()
@@ -1143,7 +1188,8 @@ def test_rewriter(cfg, body):
         except Exception:
             pass
     else:
-        reply = rewrite_openai(conf, rw, "", ping, max_tokens=512)
+        stream = section == "agent" and body.get("stream", cfg["agent"]["stream"])
+        reply = rewrite_openai(conf, rw, "", ping, max_tokens=512, stream=stream)
         try:
             base = openai_url(conf.get("base_url")).rsplit("/chat/completions", 1)[0]
             headers = {"Authorization": "Bearer " + conf["api_key"]} if conf.get("api_key") else {}
@@ -1771,13 +1817,8 @@ def agent_chat(cfg, system, parts, *, on_event=None):
     ag = cfg["agent"]
     knobs = {"temperature": float(ag["temperature"]), "top_p": 0.9, "max_length": 4096}
     if ag.get("provider") == "gemini":
-        key_file = Path(ag.get("gemini_key_file") or "")
-        key = key_file.read_text(encoding="utf-8").strip() if key_file.is_file() else cfg["rewriter"]["gemini"].get("api_key", "")
-        return rewrite_gemini({"api_key": key, "model": ag.get("gemini_model")}, knobs, system, parts, max_tokens=8192)
-    endpoint = cfg["rewriter"]["openai"]
-    if not (endpoint.get("base_url") or "").strip():
-        endpoint = {"base_url": ag["base_url"], "model": ag.get("model")}
-    return rewrite_openai(endpoint, knobs, system, parts, max_tokens=4096,
+        return rewrite_gemini(model_endpoint(cfg, "agent", "gemini"), knobs, system, parts, max_tokens=8192)
+    return rewrite_openai(ag["openai"], knobs, system, parts, max_tokens=4096,
                           stream=ag.get("stream", False), on_event=on_event)
 
 
@@ -2281,7 +2322,9 @@ class Handler(BaseHTTPRequestHandler):
                 b = self.body_json()
                 return self.send_json(move_assets(b["ids"], b.get("folder")))
             if url.path == "/api/rewriter/test":
-                return self.send_json(test_rewriter(cfg, self.body_json()))
+                return self.send_json(test_model_endpoint(cfg, self.body_json(), "rewriter"))
+            if url.path == "/api/agent/test":
+                return self.send_json(test_model_endpoint(cfg, self.body_json(), "agent"))
             if url.path == "/api/rewrite":
                 b = self.body_json()
                 if b.get("mode") == "image":

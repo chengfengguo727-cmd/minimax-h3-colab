@@ -247,6 +247,8 @@ fieldset select, fieldset input[type=number], fieldset input[type=text], fieldse
 .prov input:checked + span { background: var(--yellow); }
 .prov-panel { display: none; flex-direction: column; gap: 10px; border: 2px dashed var(--ink); border-radius: 14px; padding: 12px; background: #fffdf6; }
 .prov-panel.on { display: flex; }
+#cfgAgentSettings summary { cursor: pointer; font-weight: 800; }
+#cfgAgentSettings details[open] summary { margin-bottom: 8px; }
 .key-row { display: flex; gap: 8px; align-items: center; }
 .key-row .pill { flex: none; white-space: nowrap; }
 .verify { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
