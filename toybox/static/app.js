@@ -765,6 +765,8 @@ async function openSettings() {
     details.open = $("[data-panel]", details).dataset.panel === $("#agentPlanner").value;
   }
   $("#cfgAgentStream").checked = c.agent.stream;
+  $("#cfgAgentMaxTokens").value = c.agent.max_tokens;
+  $("#cfgAgentLmStudio").checked = c.agent.lmstudio_no_thinking;
   showProvider(rw.provider || "local");
   $("#cfgUrl").value = c.comfy_url;
   $("#cfgLoras").innerHTML = lora_nodes.map(l => `
@@ -799,6 +801,7 @@ async function verifyProvider(panel) {
   try {
     const r = await api(planner ? "api/agent/test" : "api/rewriter/test", {
       provider, conf: providerForm(panel), stream: planner && $("#cfgAgentStream").checked,
+      lmstudio_no_thinking: planner && $("#cfgAgentLmStudio").checked,
     });
     out.className = "vres ok";
     out.textContent = `✅ 端點活著（${(r.ms / 1000).toFixed(1)} 秒，回覆「${r.reply}」）` + (r.models.length ? `，清單抓到 ${r.models.length} 個模型` : "");
@@ -817,7 +820,11 @@ async function saveSettings() {
     image_side: +$("#cfgSide").value,
     ...remoteProfiles($("#cfgRewriterSettings")),
   });
-  Object.assign(c.agent, remoteProfiles($("#cfgAgentSettings")), { stream: $("#cfgAgentStream").checked });
+  Object.assign(c.agent, remoteProfiles($("#cfgAgentSettings")), {
+    stream: $("#cfgAgentStream").checked,
+    max_tokens: $("#cfgAgentMaxTokens").valueAsNumber,
+    lmstudio_no_thinking: $("#cfgAgentLmStudio").checked,
+  });
   c.comfy_url = $("#cfgUrl").value.trim();
   const sel = [...document.querySelectorAll("[data-lora]")];
   c.loras = { drama: sel.filter(s => s.value === "drama").map(s => s.dataset.lora), action: sel.filter(s => s.value === "action").map(s => s.dataset.lora) };

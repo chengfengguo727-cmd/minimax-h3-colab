@@ -101,6 +101,8 @@ DEFAULT_CONFIG = {
         "gemini_key_file": "",
         "temperature": 0.6,
         "max_seconds": 60,
+        "max_tokens": 4096,
+        "lmstudio_no_thinking": False,
         "stream": False,
     },
     # 🖼 圖片 tab: Qwen-Image 2.1 with ComfyUI's own template wiring (TextEncodeQwenImage21 + KSampler, cfg 1)
@@ -252,6 +254,10 @@ def save_config(new):
     with CONFIG_LOCK:
         old = load_config()
         new = {k: copy.deepcopy(new[k]) for k in DEFAULT_CONFIG if k in new}
+        if "max_tokens" in new.get("agent", {}):
+            value = new["agent"]["max_tokens"]
+            if type(value) is not int or value <= 0:
+                raise ValueError("規劃輸出上限須為正整數")
         secrets = {}
         for section, provider, name in API_KEYS:
             group = new.setdefault(section, {})
@@ -1082,10 +1088,10 @@ def openai_url(base):
     return base if base.endswith("/chat/completions") else base + "/chat/completions"
 
 
-def read_chat_stream(response, on_event):
+def sse_data(response, on_event):
     if response.headers.get_content_type() != "text/event-stream":
         raise RuntimeError("端點未回傳 SSE。請確認端點支援串流，或在設定關閉本地 MoE 串流。")
-    chunks, data_lines = [], []
+    data_lines = []
     for raw_line in response:
         line = raw_line.decode("utf-8").rstrip("\r\n")
         if line.startswith("data:"):
@@ -1096,8 +1102,17 @@ def read_chat_stream(response, on_event):
         data_lines.clear()
         if on_event:
             on_event()
+        yield data
+
+
+def read_chat_stream(response, on_event):
+    chunks = []
+    finish_reason = None
+    reasoning = False
+    for data in sse_data(response, on_event):
         if data.strip() == "[DONE]":
-            return {"choices": [{"message": {"content": "".join(chunks)}}]}
+            return {"choices": [{"message": {"content": "".join(chunks)}, "finish_reason": finish_reason}],
+                    "has_reasoning": reasoning}
 
         event = json.loads(data)
         if event.get("error"):
@@ -1106,13 +1121,16 @@ def read_chat_stream(response, on_event):
             raise RuntimeError("端點串流錯誤：" + str(detail)[:300])
         for choice in event.get("choices") or []:
             if choice.get("index", 0) == 0:
-                content = (choice.get("delta") or {}).get("content")
+                finish_reason = choice.get("finish_reason") or finish_reason
+                delta = choice.get("delta") or {}
+                reasoning = reasoning or bool(delta.get("reasoning_content") or delta.get("reasoning"))
+                content = delta.get("content")
                 if isinstance(content, str):
                     chunks.append(content)
     raise RuntimeError("端點串流在收到 [DONE] 前中斷。")
 
 
-def rewrite_openai(oa, rw, system, parts, max_tokens=None, *, stream=False, on_event=None):
+def rewrite_openai(oa, rw, system, parts, max_tokens=None, *, stream=False, on_event=None, diagnostics=None):
     content = [{"type": "text", "text": p} if kind == "text" else
                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + jpeg_b64(p)}} for kind, p in parts]
     messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": content}]
@@ -1127,12 +1145,59 @@ def rewrite_openai(oa, rw, system, parts, max_tokens=None, *, stream=False, on_e
         reader = lambda response: read_chat_stream(response, on_event)
     out = http_json(openai_url(oa.get("base_url")), payload, headers, reader=reader)
     try:
-        text = out["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError):
+        choice = out["choices"][0]
+        message = choice["message"]
+        text = message.get("content") if diagnostics is not None else message["content"]
+    except (AttributeError, KeyError, IndexError, TypeError):
         raise RuntimeError("端點沒有回傳內容：" + json.dumps(out, ensure_ascii=False)[:400])
     if isinstance(text, list):
         text = "".join(c.get("text", "") for c in text)
-    return re.sub(r"<think>.*?</think>", "", text or "", flags=re.S).strip()
+    if diagnostics is not None:
+        diagnostics.update(finish_reason=choice.get("finish_reason"), max_tokens=payload["max_tokens"],
+                           reasoning=bool(out.get("has_reasoning") or message.get("reasoning_content")
+                                          or message.get("reasoning") or "<think>" in (text or "")))
+    text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S).strip()
+    return "" if diagnostics is not None and text.startswith("<think>") else text
+
+
+def read_lmstudio_stream(response, on_event):
+    for data in sse_data(response, on_event):
+        event = json.loads(data)
+        if event.get("type") == "error":
+            raise RuntimeError("LM Studio 串流錯誤：" + str(event["error"].get("message", ""))[:300])
+        if event.get("type") == "chat.end":
+            return event["result"]
+    raise RuntimeError("LM Studio 串流在收到 chat.end 前中斷。")
+
+
+def lmstudio_plan(oa, rw, system, parts, max_tokens, *, stream=False, on_event=None, diagnostics=None):
+    # Keep the configured origin (and any reverse-proxy prefix) for the native endpoint.
+    base = (oa.get("base_url") or "").strip().rstrip("/")
+    if not base:
+        raise ValueError("還沒有填 LM Studio 端點網址")
+    for suffix in ("/api/v1/chat", "/v1/chat/completions", "/api/v1", "/v1", "/chat/completions"):
+        if base.endswith(suffix):
+            base = base.removesuffix(suffix)
+            break
+    model = (oa.get("model") or "").strip()
+    if not model:
+        raise ValueError("請填寫 LM Studio 規劃模型 ID")
+    inputs = [{"type": "text", "content": p} if kind == "text" else
+              {"type": "image", "data_url": "data:image/jpeg;base64," + jpeg_b64(p)} for kind, p in parts]
+    payload = {"model": model, "input": inputs, "system_prompt": system,
+               "temperature": float(rw["temperature"]), "top_p": float(rw["top_p"]),
+               "max_output_tokens": max_tokens, "reasoning": "off", "store": False, "stream": stream}
+    headers = {"Authorization": "Bearer " + oa["api_key"]} if oa.get("api_key") else {}
+    reader = json.load
+    if stream:
+        headers["Accept"] = "text/event-stream"
+        reader = lambda response: read_lmstudio_stream(response, on_event)
+    out = http_json(base + "/api/v1/chat", payload, headers, reader=reader)
+    stats = out.get("stats") or {}
+    if diagnostics is not None:
+        diagnostics.update(max_tokens=max_tokens, reasoning=bool(stats.get("reasoning_output_tokens")),
+                           finish_reason="length" if (stats.get("total_output_tokens") or 0) >= max_tokens else None)
+    return "".join(item["content"] for item in out["output"] if item.get("type") == "message").strip()
 
 
 def rewrite(cfg, req):
@@ -1189,13 +1254,17 @@ def test_model_endpoint(cfg, body, section):
             pass
     else:
         stream = section == "agent" and body.get("stream", cfg["agent"]["stream"])
-        reply = rewrite_openai(conf, rw, "", ping, max_tokens=512, stream=stream)
+        native = section == "agent" and body.get("lmstudio_no_thinking", cfg["agent"]["lmstudio_no_thinking"])
+        complete = lmstudio_plan if native else rewrite_openai
+        reply = complete(conf, rw, "", ping, max_tokens=512, stream=stream)
         try:
             base = openai_url(conf.get("base_url")).rsplit("/chat/completions", 1)[0]
             headers = {"Authorization": "Bearer " + conf["api_key"]} if conf.get("api_key") else {}
             models = [m["id"] for m in http_json(base + "/models", headers=headers, timeout=20).get("data", [])]
         except Exception:
             pass
+    if section == "agent" and not reply:
+        raise RuntimeError("模型沒有回傳正文。請檢查模型的思考設定。")
     return {"ok": True, "reply": reply[:80], "ms": int((time.time() - t0) * 1000), "models": models}
 
 
@@ -1812,28 +1881,41 @@ def agent_log(run_id, text):
         save_json(AGENT_PATH, runs)
 
 
-def agent_chat(cfg, system, parts, *, on_event=None):
-    """The planner: OpenAI-compatible (local MoE) or Gemini (key read from a file at call time)."""
+def agent_chat(cfg, system, parts, *, on_event=None, diagnostics=None):
     ag = cfg["agent"]
-    knobs = {"temperature": float(ag["temperature"]), "top_p": 0.9, "max_length": 4096}
+    max_tokens = int(ag.get("max_tokens", DEFAULT_CONFIG["agent"]["max_tokens"]))
+    knobs = {"temperature": float(ag["temperature"]), "top_p": 0.9, "max_length": max_tokens}
     if ag.get("provider") == "gemini":
         return rewrite_gemini(model_endpoint(cfg, "agent", "gemini"), knobs, system, parts, max_tokens=8192)
-    return rewrite_openai(ag["openai"], knobs, system, parts, max_tokens=4096,
-                          stream=ag.get("stream", False), on_event=on_event)
+    complete = lmstudio_plan if ag.get("lmstudio_no_thinking") else rewrite_openai
+    return complete(ag["openai"], knobs, system, parts, max_tokens=max_tokens,
+                    stream=ag.get("stream", False), on_event=on_event, diagnostics=diagnostics)
 
 
 def parse_contract(text):
-    text = re.sub(r"^```\w*\n|\n```$", "", (text or "").strip())
+    if not text:
+        return None, "模型沒有回傳規劃正文"
     m = re.search(r"\{.*\}", text, flags=re.S)
     if not m:
-        return None
+        return None, "正文缺少完整的 JSON 物件"
     try:
-        return json.loads(m.group(0))
-    except ValueError:
+        return json.loads(m.group(0)), None
+    except json.JSONDecodeError as first:
         try:  # the most common small-model slip: a trailing comma before } or ]
-            return json.loads(re.sub(r",\s*([}\]])", r"\1", m.group(0)))
-        except ValueError:
-            return None
+            return json.loads(re.sub(r",\s*([}\]])", r"\1", m.group(0))), None
+        except json.JSONDecodeError:
+            return None, f"JSON 第 {first.lineno} 行第 {first.colno} 欄無法解析（{first.msg}）"
+
+
+def plan_response_error(error, diagnostics, text):
+    if diagnostics.get("finish_reason") == "length":
+        limit = diagnostics["max_tokens"]
+        if not text and diagnostics.get("reasoning"):
+            return f"模型思考用完 {limit:,} 個 token，未回傳規劃正文。請關閉思考或提高規劃輸出上限。"
+        return f"規劃達到 {limit:,} 個 token 的輸出上限。{error}。請提高規劃輸出上限。"
+    if not text and diagnostics.get("reasoning"):
+        return "模型只回傳思考內容。請關閉思考後重新規劃。"
+    return error
 
 
 def spoken(seg):
@@ -1898,21 +1980,31 @@ def agent_plan(cfg, run, revise=None, *, on_event=None):
     else:
         parts.append(("text", f"指示：{run['instruction']}"))
     t0 = time.time()
-    raw = agent_chat(cfg, system, parts, on_event=on_event)
-    plan = parse_contract(raw)
-    errors = ["輸出不是合法的 JSON"] if plan is None else check_contract(plan, labels, total)[1]
+    diagnostics = {}
+    raw = agent_chat(cfg, system, parts, on_event=on_event, diagnostics=diagnostics)
+    plan, parse_error = parse_contract(raw)
+    if plan is None:
+        detail = plan_response_error(parse_error, diagnostics, raw)
+        if diagnostics.get("finish_reason") == "length" or not raw:
+            raise RuntimeError(detail)
+        errors = [detail]
+    else:
+        errors = check_contract(plan, labels, total)[1]
     rounds = 1
     if errors:  # one correction round with the exact problems, like T8's correction_messages
         agent_log(run["id"], "契約檢查沒過，送回修正：" + "；".join(errors))
         fix = parts + [("text", "你上一版的輸出：\n" + raw[:6000] + "\n\n有這些問題，只修正它們，輸出完整 JSON：\n- "
                         + "\n- ".join(errors))]
-        raw2 = agent_chat(cfg, system, fix, on_event=on_event)
-        plan2 = parse_contract(raw2)
+        diagnostics = {}
+        raw2 = agent_chat(cfg, system, fix, on_event=on_event, diagnostics=diagnostics)
+        plan2, parse_error = parse_contract(raw2)
         rounds = 2
         if plan2 is not None:
-            plan, raw = plan2, raw2
-    if plan is None:
-        raise RuntimeError("規劃模型沒有給出合法的 JSON：" + raw[:300])
+            plan = plan2
+        elif plan is None:
+            raise RuntimeError(f"規劃模型兩輪都未回傳合法 JSON。第二輪：{plan_response_error(parse_error, diagnostics, raw2)}")
+        else:
+            agent_log(run["id"], f"修正回覆無法使用，沿用初稿。{plan_response_error(parse_error, diagnostics, raw2)}")
     plan, errors, fixes = check_contract(plan, labels, total)
     return plan, {"seconds": round(time.time() - t0, 1), "rounds": rounds, "errors": errors, "fixes": fixes}
 

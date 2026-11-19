@@ -216,6 +216,8 @@
             <label>API 金鑰（本機伺服器可留空）<span class="key-row"><input data-api-key type="password" autocomplete="off"><button type="button" class="pill small" data-clear-key>清除</button></span></label>
             <label>規劃模型 <input data-model type="text" list="agentOaModels" placeholder="輸入模型 ID 或從驗證清單選擇"></label>
             <datalist id="agentOaModels"></datalist>
+            <label>規劃輸出上限（token） <input id="cfgAgentMaxTokens" type="number" min="1" step="1" required></label>
+            <label class="switch"><input id="cfgAgentLmStudio" type="checkbox"><span></span> LM Studio 原生 API（關閉思考）</label>
             <label class="switch"><input id="cfgAgentStream" type="checkbox"><span></span> 規劃使用 SSE</label>
             <div class="verify"><button type="button" class="pill small blue" data-verify>🔍 驗證</button><span class="vres" aria-live="polite"></span></div>
           </div>
