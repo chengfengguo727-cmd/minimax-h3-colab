@@ -1674,8 +1674,10 @@ def agent_chat(cfg, system, parts):
         key_file = Path(ag.get("gemini_key_file") or "")
         key = key_file.read_text(encoding="utf-8").strip() if key_file.is_file() else cfg["rewriter"]["gemini"].get("api_key", "")
         return rewrite_gemini({"api_key": key, "model": ag.get("gemini_model")}, knobs, system, parts, max_tokens=8192)
-    return rewrite_openai({"base_url": ag["base_url"], "api_key": "", "model": ag.get("model")}, knobs, system, parts,
-                          max_tokens=4096)
+    endpoint = cfg["rewriter"]["openai"]
+    if not (endpoint.get("base_url") or "").strip():
+        endpoint = {"base_url": ag["base_url"], "model": ag.get("model")}
+    return rewrite_openai(endpoint, knobs, system, parts, max_tokens=4096)
 
 
 def parse_contract(text):

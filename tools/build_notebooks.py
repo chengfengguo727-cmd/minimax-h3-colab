@@ -325,7 +325,7 @@ TOYBOX = [
 
 **網頁裡能做的事**
 - 🖼 **圖片**（選用）：文生圖，或拿最多 8 張圖做編輯（換表情、換衣服、換風格、把人放進場景）。用 [P-H3-Image](https://huggingface.co/PrunaAI/P-H3-Image-Comfy) 掛在同一顆 H3 模型上，只多約 10 GB
-- 🤖 **短片 Agent**：一句話規劃成多段短片（要先在 ⚙ 設定填 Gemini 金鑰）
+- 🤖 **短片 Agent**：一句話規劃成多段短片。選本地 MoE 時會使用 ⚙ 設定裡的 OpenAI 相容端點；選 Gemini 時請填 Gemini 金鑰。
 - 🧸 **參考生成**：圖片 9 張／影片 3 支／聲音 3 段當參考，提示詞裡用 `@圖片1` 標記
 - 🎞 **頭尾格**：只放首格、只放尾格、或兩張都放
 - ✏️ **純文字**：只靠一段描述
@@ -339,7 +339,7 @@ TOYBOX = [
 
 模型：`Minimax-h3_Singularity_x_10Eros-Max_PRISM`（int8）＋官方 Qwen3-VL 文字編碼器與 VAE；LoRA、語意橋、潛空間放大器與改寫模型鏡像在 [dseditor/minimax-h3-studio-assets](https://huggingface.co/dseditor/minimax-h3-studio-assets)（各檔來源見該頁）。授權依照各來源模型。
 
-最新版：<https://github.com/dseditor/minimax-h3-colab>"""),
+最新版：<https://github.com/chengfengguo727-cmd/minimax-h3-colab>"""),
     code("""#@title ① 檢查環境＋安裝 ComfyUI、節點與 H3 Toybox（GPU 或驅動不符就停下，不會安裝）
 import torch, shutil, subprocess, sys, os
 from pathlib import Path
@@ -385,9 +385,10 @@ for name, url in NODES.items():
     clone(url, COMFY / 'custom_nodes' / name)
 # 導演 Skill 只是文字檔：放在 custom_nodes 外面，不載入它的節點
 clone('https://github.com/T8mars/comfyui-minimax-h3-prompt-enhancer-T8', '/content/t8-enhancer')
-# H3 Toybox 本體
-clone('https://github.com/dseditor/minimax-h3-colab.git', '/content/minimax-h3-colab')
-APP = Path('/content/minimax-h3-colab/toybox')
+# H3 Toybox 本體。使用 fork 專用目錄，避免沿用舊執行階段的上游 checkout。
+TOYBOX_REPO = Path('/content/minimax-h3-colab-fork')
+clone('https://github.com/chengfengguo727-cmd/minimax-h3-colab.git', TOYBOX_REPO)
+APP = TOYBOX_REPO / 'toybox'
 print('ffmpeg:', shutil.which('ffmpeg') or '沒有（延伸影片會失敗）')
 out = subprocess.run([sys.executable, '-c', 'import torch;print(torch.__version__, torch.version.cuda, torch.cuda.is_available())'],
                      capture_output=True, text=True)
